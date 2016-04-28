@@ -195,12 +195,21 @@ static size_t _BRTransactionOutputData(const BRTransaction *tx, uint8_t *data, s
 static size_t _BRTransactionData(const BRTransaction *tx, uint8_t *data, size_t dataLen, size_t index, int hashType)
 {
     BRTxInput input;
-    int anyoneCanPay = (hashType & SIGHASH_ANYONECANPAY), sigHash = (hashType & 0x1f);
-    size_t i, off = 0;
+    int anyoneCanPay = (hashType & SIGHASH_ANYONECANPAY), sigHash = (hashType & 0x1f), witnessFlag = 0;
+    size_t i, off = 0, count;
     
     if (anyoneCanPay && index >= tx->inCount) return 0;
     if (data && off + sizeof(uint32_t) <= dataLen) set_u32le(&data[off], tx->version); // tx version
     off += sizeof(uint32_t);
+
+    for (i = 0; index == SIZE_MAX && ! witnessFlag && i < tx->inCount; i++) {
+        if (tx->inputs[i].signature && tx->inputs[i].witness && tx->inputs[i].witLen > 0) witnessFlag = 1;
+    }
+    
+    if (witnessFlag && data && off + 2 <= dataLen) {
+        data[off++] = 0; // witness marker
+        data[off++] = witnessFlag; // witness flag
+    }
     
     if (! anyoneCanPay) {
         off += BRVarIntSet((data ? &data[off] : NULL), (off <= dataLen ? dataLen - off : 0), tx->inCount);
@@ -244,6 +253,17 @@ static size_t _BRTransactionData(const BRTransaction *tx, uint8_t *data, size_t 
         off += _BRTransactionOutputData(tx, (data ? &data[off] : NULL), (off <= dataLen ? dataLen - off : 0), index);
     }
     else off += BRVarIntSet((data ? &data[off] : NULL), (off <= dataLen ? dataLen - off : 0), 0); //SIGHASH_NONE outputs
+
+    for (i = 0; witnessFlag && i < tx->inCount; i++) { // witness serialization
+        count = BRScriptElements(NULL, 0, tx->inputs[i].witness, tx->inputs[i].witLen);
+        off += BRVarIntSet((data ? &data[off] : NULL), (off <= dataLen ? dataLen - off : 0), count);
+
+        if (data && off + tx->inputs[i].witLen <= dataLen) {
+            memcpy(&data[off], tx->inputs[i].witness, tx->inputs[i].witLen);
+        }
+
+        off += tx->inputs[i].witLen;
+    }
     
     if (data && off + sizeof(uint32_t) <= dataLen) set_u32le(&data[off], tx->lockTime); // locktime
     off += sizeof(uint32_t);
@@ -361,7 +381,7 @@ BRTransaction *BRTransactionParse(const uint8_t *buf, size_t bufLen)
 
     array_set_count(tx->inputs, tx->inCount);
     
-    for (i = 0; i < tx->inCount; i++) {
+    for (i = 0; off <= bufLen && i < tx->inCount; i++) {
         input = &tx->inputs[i];
         input->txHash = (off + sizeof(UInt256) <= bufLen) ? get_u256(&buf[off]) : UINT256_ZERO;
         off += sizeof(UInt256);
@@ -396,12 +416,12 @@ BRTransaction *BRTransactionParse(const uint8_t *buf, size_t bufLen)
         off += sLen;
     }
     
-    for (i = 0; witnessFlag && i < tx->inCount; i++) {
+    for (i = 0; witnessFlag && off <= bufLen && i < tx->inCount; i++) {
         input = &tx->inputs[i];
         count = BRVarInt(&buf[off], (off <= bufLen ? bufLen - off : 0), &len);
         off += len;
         
-        for (j = 0, sLen = 0; j < count; j++) {
+        for (j = 0, sLen = 0; off + sLen <= bufLen && j < count; j++) {
             sLen += BRVarInt(&buf[off + sLen], (off + sLen <= bufLen ? bufLen - (off + sLen) : 0), &len);
             sLen += len;
         }
@@ -418,8 +438,9 @@ BRTransaction *BRTransactionParse(const uint8_t *buf, size_t bufLen)
         tx = NULL;
     }
     else if (isSigned) {
-        BRSHA256_2(&tx->txHash, buf, off);
-        tx->wtxHash = tx->txHash;
+        BRSHA256_2((witnessFlag ? &tx->wtxHash : &tx->txHash), buf, off);
+        if (! witnessFlag) tx->wtxHash = tx->txHash;
+        // TODO: XXXX calculate txHash if this is a witness serialization
     }
     
     return tx;
